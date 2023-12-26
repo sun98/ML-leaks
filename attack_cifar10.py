@@ -7,6 +7,7 @@ Last Modified by: Suibin Sun
 Last Modified: 2023-12-25, 8:46:48 pm
 -----
 """
+# %%
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,9 +16,16 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, TensorDataset, Subset
 from tqdm import tqdm
 from PIL import Image
+import numpy as np
 
 
-num_epochs = 5
+num_epochs_target = 10
+num_epochs_shadow = 10
+num_epochs_attack = 10
+
+# NOTE: this code is only tested on CPU, there may be some issues on GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"device: {device}")
 
 # define transform and load dataset
 transform = transforms.Compose(
@@ -43,9 +51,7 @@ data_eval_attack = Subset(train_set, range(split_size * 2, len(train_set)))
 # make sure the splitted dataset are transformed
 class TransformedTensorDataset(TensorDataset):
     def __init__(self, data_tensor, target_tensor, transform=None):
-        assert data_tensor.size(0) == target_tensor.size(
-            0
-        )  # assuming first dimension is data size
+        assert data_tensor.size(0) == target_tensor.size(0)
         self.data_tensor = data_tensor
         self.target_tensor = target_tensor
         self.transform = transform
@@ -105,70 +111,103 @@ loader_eval_attack = DataLoader(data_eval_attack, batch_size=64, shuffle=True)
 
 # %% define the CNN for the target model and the shadow model
 class CNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=6, kernel_size=5)
-        self.conv2 = nn.Conv2d(in_channels=6, out_channels=16, kernel_size=5)
-
-        self.fc1 = nn.Linear(in_features=16 * 5 * 5, out_features=128)
-        self.fc2 = nn.Linear(in_features=128, out_features=10)
-
+    def __init__(self, input_size=3):
+        super(CNN, self).__init__()
+        self.input_size = input_size
+        self.conv1 = nn.Conv2d(
+            in_channels=input_size, out_channels=48, kernel_size=(3, 3)
+        )
+        self.conv2 = nn.Conv2d(in_channels=48, out_channels=96, kernel_size=(3, 3))
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.tanh = nn.Tanh()
-        self.dropout1 = nn.Dropout(0.1)
+        if input_size == 3:
+            self.fc_features = 6 * 6 * 96
+        else:
+            self.fc_features = 5 * 5 * 96
+        self.fc1 = nn.Linear(in_features=self.fc_features, out_features=512)
+        self.fc2 = nn.Linear(in_features=512, out_features=128)
+        self.fc3 = nn.Linear(in_features=128, out_features=10)
 
     def forward(self, x):
-        x = self.tanh(self.conv1(x))
-        x = self.dropout1(x)
+        x = self.conv1(x)
+        x = F.relu(x)
         x = self.pool(x)
-
-        x = self.tanh(self.conv2(x))
+        x = self.conv2(x)
+        x = F.relu(x)
         x = self.pool(x)
-
-        x = x.view(-1, 16 * 5 * 5)
-        x = self.tanh(self.fc1(x))
-        x = self.fc2(x)
+        x = x.view(-1, self.fc_features)  # reshape x
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
         return x
 
 
-target_model = CNN()
-shadow_model = CNN()
+target_model = CNN().to(device)
+shadow_model = CNN().to(device)
+target_loss = nn.CrossEntropyLoss()
+shadow_loss = nn.CrossEntropyLoss()
 
-# %% train the target model and the shadow model
-optimizer_target = torch.optim.SGD(target_model.parameters(), lr=0.01)
-for epoch in range(num_epochs):
-    print(f"epoch {epoch}/{num_epochs}")
+
+# %% train the target model
+optimizer_target = torch.optim.Adam(target_model.parameters(), lr=0.001)
+loss = 999
+for epoch in range(num_epochs_target):
+    print(f"epoch {epoch}/{num_epochs_target} loss={loss}")
+    loss = 0
     for i, (images, labels) in tqdm(enumerate(loader_train_target)):
+        images = images.to(device)
+        labels = labels.to(device)
         outputs_target = target_model(images)
-        loss_target = F.nll_loss(outputs_target, labels)
+        loss_target = target_loss(outputs_target, labels)
         optimizer_target.zero_grad()
         loss_target.backward()
         optimizer_target.step()
+        loss += loss_target
 target_model.eval()
 correct = 0
 total = 0
 with torch.no_grad():
-    for images, labels in loader_nonmember_target:
+    for images, labels in loader_train_target:
+        images = images.to(device)
+        labels = labels.to(device)
         target = target_model(images)
         _, prediction = torch.max(target, dim=1)
         correct += (prediction == labels).sum().item()
         total += labels.size(0)
-    print(f"target model accu: {correct}/{total}={correct/total*100:.2f}%")
+    print(f"target model accu (train set): {correct}/{total}={correct/total*100:.2f}%")
+correct = 0
+total = 0
+with torch.no_grad():
+    for images, labels in loader_nonmember_target:
+        images = images.to(device)
+        labels = labels.to(device)
+        target = target_model(images)
+        _, prediction = torch.max(target, dim=1)
+        correct += (prediction == labels).sum().item()
+        total += labels.size(0)
+    print(f"target model accu (test set): {correct}/{total}={correct/total*100:.2f}%")
 
-optimizer_shadow = torch.optim.SGD(shadow_model.parameters(), lr=0.01)
-for epoch in range(num_epochs):
-    print(f"epoch {epoch}/{num_epochs}")
+# %% train the shadow model
+optimizer_shadow = torch.optim.Adam(shadow_model.parameters(), lr=0.001)
+loss = 999
+for epoch in range(num_epochs_shadow):
+    print(f"epoch {epoch}/{num_epochs_target} loss={loss}")
+    loss = 0
     for i, (images, labels) in tqdm(enumerate(loader_train_shadow)):
+        images = images.to(device)
+        labels = labels.to(device)
         outputs_shadow = shadow_model(images)
-        loss_shadow = F.nll_loss(outputs_shadow, labels)
+        loss_shadow = shadow_loss(outputs_shadow, labels)
         optimizer_shadow.zero_grad()
         loss_shadow.backward()
         optimizer_shadow.step()
+        loss += loss_shadow
 shadow_model.eval()
 correct = 0
 total = 0
 with torch.no_grad():
     for images, labels in loader_nonmember_target:
+        images = images.to(device)
+        labels = labels.to(device)
         target = shadow_model(images)
         _, prediction = torch.max(target, dim=1)
         correct += (prediction == labels).sum().item()
@@ -189,15 +228,19 @@ class AttackModel(nn.Module):
         return x
 
 
-attack_model = AttackModel()
+attack_model = AttackModel().to(device)
 
 # %% train the attack model
 
-optimizer_attack = torch.optim.SGD(attack_model.parameters(), lr=0.01)
-for epoch in range(num_epochs):
-    print(f"epoch {epoch}/{num_epochs}")
+optimizer_attack = torch.optim.Adam(attack_model.parameters(), lr=0.001)
+loss = 999
+for epoch in range(num_epochs_attack):
+    print(f"epoch {epoch}/{num_epochs_attack}, loss={loss}")
+    loss = 0
     for idx, (images, labels) in tqdm(enumerate(loader_train_attack)):
-        posteriors_shadow = shadow_model(images)
+        images = images.to(device)
+        labels = labels.to(device)
+        posteriors_shadow = F.softmax(shadow_model(images), dim=1)
         top3_posteriors = torch.topk(posteriors_shadow, 3, dim=1)[0]
         labels_attack = labels.float().unsqueeze(1)
 
@@ -208,35 +251,47 @@ for epoch in range(num_epochs):
         optimizer_attack.zero_grad()
         loss_attack.backward()
         optimizer_attack.step()
+        loss += loss_attack
 
 # %% eval the performance of attack model
 attack_model.eval()
 total = 0
-TP, TN, FP, FN = 0, 0, 0, 0
+
+all_pred = torch.empty((1))
+all_labels = torch.empty((1))
 
 with torch.no_grad():
     for images, labels in loader_eval_attack:
-        posteriors_target = target_model(images)
+        images = images.to(device)
+        labels = labels.to(device)
+        posteriors_target = F.softmax(target_model(images), dim=1)
         top3_posteriors = torch.topk(posteriors_target, 3, dim=1)[0]
 
         # attack_outputs = attack_model(posteriors_target)
         attack_outputs = attack_model(top3_posteriors)
-        # print(attack_outputs)
 
-        pred = attack_outputs > 0.5
-        real = labels.float() > 0.5
-        # print(f"pred={pred.sum().item() / len(pred)} real={real.sum().item() / len(real)}")
-        TP += (pred & real).sum().item()
-        TN += ((~pred) & (~real)).sum().item()
-        FP += (pred & (~real)).sum().item()
-        FN += ((~pred) & real).sum().item()
+        all_pred = torch.cat((all_pred, attack_outputs.squeeze()), dim=0)
+        all_labels = torch.cat((all_labels, labels.squeeze()), dim=0)
 
-print(f"TP={TP} TN={TN} FP={FP} FN={FN}")
-accu = (TP + TN) / (TP + TN + FP + FN)
-precision = TP / (TP + FP)
-recall = TP / (TP + FN)
-f1 = 2 * (precision * recall) / (precision + recall)
-print(
-    f"Attack Model Accuracy on Test Set: accu={accu:.2f}, prec={precision:.2f} "
-    f"recall={recall:.2f}, f1={f1:.2f}"
-)
+# %%
+for pred_thre in np.arange(0.20, 0.65, 0.05):
+    all_pred_bin = all_pred > pred_thre
+    all_labels_bin = all_labels > 0.5  # only 0 or 1
+
+    TP = (all_pred_bin & all_labels_bin).sum().item()
+    TN = ((~all_pred_bin) & (~all_labels_bin)).sum().item()
+    FP = (all_pred_bin & (~all_labels_bin)).sum().item()
+    FN = ((~all_pred_bin) & all_labels_bin).sum().item()
+
+    print(
+        f"Attack Model Accuracy for thre={pred_thre:.2f} TP={TP} TN={TN} FP={FP} FN={FN} ",
+        end="",
+    )
+    if (TP + FP) == 0 or (TP + FN) == 0:
+        print("metrics invalid")
+        continue
+    accu = (TP + TN) / (TP + TN + FP + FN)
+    precision = TP / (TP + FP)
+    recall = TP / (TP + FN)
+    f1 = 2 * (precision * recall) / (precision + recall)
+    print(f"accu={accu:.2f} " f"prec={precision:.2f} recall={recall:.2f} f1={f1:.2f}")
